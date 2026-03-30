@@ -1,0 +1,9 @@
+azure-ai-voicelive[aiohttp]>=1.0.0
+azure-identity
+azure-core
+azure-communication-identity
+aiohttp
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+aiofiles
+python-dotenv
