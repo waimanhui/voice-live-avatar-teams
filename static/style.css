@@ -57,6 +57,7 @@ body {
 
 .sidebar-scroll {
     flex: 1;
+    min-height: 0;
     overflow-y: auto;
     padding: 16px 12px;
 }
@@ -79,7 +80,6 @@ body {
     border: 1px solid var(--border-color);
     border-radius: var(--radius);
     background: var(--bg-tertiary);
-    overflow: hidden;
 }
 
 .settings-group summary {
@@ -792,4 +792,69 @@ input[type="range"]::-webkit-slider-thumb {
     }
     .sidebar.open { left: 0; }
     .mobile-menu { display: flex; }
+
+    /* Stack app into single column on narrow screens */
+    .app-container {
+        flex-direction: column;
+    }
+
+    /* Content area: scrollable, full-width, no overflow-hidden clipping */
+    .main-content {
+        min-width: 0;
+        width: 100%;
+    }
+
+    /* Avatar video: fill width */
+    .avatar-container,
+    .avatar-video {
+        width: 100% !important;
+        max-width: 100%;
+    }
+
+    /* Chat area: shrink but stay visible */
+    .chat-area {
+        min-height: 150px;
+    }
+
+    /* Footer record button: larger touch target */
+    .record-btn {
+        min-height: 56px;
+        min-width: 56px;
+        padding: 12px 16px;
+    }
+
+    /* Input row: full width, stacked on very small screens */
+    .input-row {
+        flex-wrap: wrap;
+        gap: 6px;
+    }
+
+    .input-row input[type="text"] {
+        width: 100%;
+    }
+
+    /* Header: compact on mobile */
+    .header-bar {
+        padding: 8px 12px;
+    }
+
+    /* Sidebar footer button: full width */
+    .sidebar-footer .btn-connect {
+        width: 100%;
+    }
+}
+
+/* Extra small screens */
+@media (max-width: 480px) {
+    body {
+        font-size: 14px;
+    }
+
+    .header-bar {
+        gap: 6px;
+    }
+
+    .sound-wave {
+        margin: 0 8px;
+    }
 }

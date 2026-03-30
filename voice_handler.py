@@ -12,6 +12,7 @@ import os
 from typing import Any, Callable, Optional
 
 from azure.ai.voicelive.aio import connect
+from azure.ai.voicelive.aio._patch import ConnectionClosed
 from azure.ai.voicelive.models import (
     AvatarConfig,
     AzureCustomVoice,
@@ -64,6 +65,13 @@ class VoiceSessionHandler:
         self.is_running = False
         self._event_task: Optional[asyncio.Task] = None
         self._pending_proactive = False
+        self._video_chunk_count: int = 0
+        self._video_sent_count: int = 0
+        self._audio_chunk_count: int = 0
+        # Queue used to dispatch events from the recv pump to _dispatch_events
+        self._event_queue: asyncio.Queue = asyncio.Queue()
+        # Registered one-shot waiters: list of (wanted_types: set, future: Future)
+        self._waiters: list = []
 
     async def start(self):
         """Start the Voice Live session."""
@@ -93,11 +101,23 @@ class VoiceSessionHandler:
             ) as connection:
                 self.connection = connection
 
-                # Configure session
-                await self._setup_session(connection)
-
-                # Process events
-                await self._process_events(connection)
+                # Start the event pump as a background task FIRST so the queue
+                # is being populated before _setup_session calls _wait_for_event
+                # (SESSION_UPDATED arrives right after session.update is sent and
+                # would time out if _process_events weren't already running).
+                event_task = asyncio.create_task(self._process_events(connection))
+                self._event_task = event_task
+                try:
+                    await self._setup_session(connection)
+                    # Now just wait for the pump to finish naturally
+                    await event_task
+                except BaseException:
+                    event_task.cancel()
+                    try:
+                        await event_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    raise
 
         except asyncio.CancelledError:
             logger.info(f"Session cancelled for client {self.client_id}")
@@ -139,8 +159,52 @@ class VoiceSessionHandler:
             else recognition_language,
         )
 
-        # Build tools list
-        tools = config.get("tools", [])
+        # Build tools list — convert enabled tool names into full definition objects
+        # required by the API (plain strings cause invalid_session_update_message).
+        _TOOL_DEFINITIONS = {
+            "get_time": {
+                "type": "function",
+                "name": "get_time",
+                "description": "Returns the current date and time.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+            "get_weather": {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Returns the current weather for a given location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {
+                            "type": "string",
+                            "description": "City or location name, e.g. 'Seattle'",
+                        }
+                    },
+                    "required": ["location"],
+                },
+            },
+            "calculate": {
+                "type": "function",
+                "name": "calculate",
+                "description": "Evaluates a mathematical expression and returns the result.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": {
+                            "type": "string",
+                            "description": "A mathematical expression, e.g. '2 + 2' or 'sqrt(16)'",
+                        }
+                    },
+                    "required": ["expression"],
+                },
+            },
+        }
+        enabled_tool_names = config.get("tools", [])
+        tools = [_TOOL_DEFINITIONS[n] for n in enabled_tool_names if n in _TOOL_DEFINITIONS]
 
         # Build noise/echo settings
         noise_reduction = None
@@ -401,42 +465,86 @@ class VoiceSessionHandler:
             )
 
     async def _process_events(self, connection):
-        """Process incoming events from Voice Live API.
-        
-        Uses manual recv() loop instead of 'async for' so that individual
-        event parsing/handling errors don't kill the entire event loop.
-        """
-        while self.is_running:
-            try:
-                event = await connection.recv()
-            except (ConnectionError, OSError) as e:
-                # Parsing error from SDK — log details and continue listening
-                logger.warning(f"[RECV] Event parsing error (continuing): {type(e).__name__}: {e}")
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                # Connection closed or fatal error
-                logger.error(f"Connection error in event loop: {e}")
-                break
+        """Event pump: recv from connection and put every event onto the queue.
 
-            try:
+        A separate _dispatch_events() task drains the queue and calls
+        _handle_event(). This split allows _wait_for_event() to intercept
+        specific events from the queue before the dispatch loop sees them,
+        without any iterator contention.
+        """
+        dispatch_task = asyncio.create_task(self._dispatch_events(connection))
+        try:
+            while self.is_running:
+                try:
+                    event = await connection.recv()
+                except (ConnectionError, OSError) as e:
+                    logger.warning(f"[RECV] Event parsing error (continuing): {type(e).__name__}: {e}")
+                    continue
+                except asyncio.CancelledError:
+                    raise
+                except ConnectionClosed as e:
+                    # Normal shutdown path: remote closed the WebSocket (code 1006
+                    # means no close frame — typical of server-initiated teardown).
+                    logger.info(f"[RECV] WebSocket closed (code {e.code}): {e.reason or 'connection ended'}")
+                    break
+                except Exception as e:
+                    logger.error(f"Connection error in event loop: {e}")
+                    break
+
                 etype = getattr(event, 'type', 'unknown')
                 if etype not in (ServerEventType.RESPONSE_AUDIO_DELTA,
                                  ServerEventType.RESPONSE_AUDIO_TRANSCRIPT_DELTA,
                                  "response.video.delta"):
                     logger.info(f"[RECV] {etype}: {event}")
                 if etype == "response.video.delta":
-                    self._video_chunk_count = getattr(self, '_video_chunk_count', 0) + 1
+                    self._video_chunk_count += 1
                     if self._video_chunk_count <= 5 or self._video_chunk_count % 100 == 0:
                         delta_len = len(event.get('delta', '')) if hasattr(event, 'get') else 0
                         logger.info(f"[RECV] response.video.delta #{self._video_chunk_count}, delta_len={delta_len}")
+
+                # Put onto the shared queue for _wait_for_event / _dispatch_events
+                await self._event_queue.put(event)
+        finally:
+            dispatch_task.cancel()
+            try:
+                await dispatch_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+    async def _dispatch_events(self, connection):
+        """Sole consumer of the event queue.
+
+        For each event dequeued:
+          1. Check registered one-shot waiters (_waiters). If any match the
+             event type, resolve the first matching Future and remove it from
+             the list — the event is NOT passed to _handle_event in that case.
+          2. Otherwise call _handle_event normally.
+
+        This makes _wait_for_event() race-free: it registers a Future here
+        rather than competing for queue items.
+        """
+        while True:
+            try:
+                event = await self._event_queue.get()
+            except asyncio.CancelledError:
+                raise
+            etype = getattr(event, 'type', 'unknown')
+            # Check one-shot waiters
+            matched_idx = None
+            for i, (wanted, fut) in enumerate(self._waiters):
+                if (etype in wanted or getattr(event, 'type', None) in wanted) and not fut.done():
+                    matched_idx = i
+                    break
+            if matched_idx is not None:
+                _, fut = self._waiters.pop(matched_idx)
+                fut.set_result(event)
+                continue  # do NOT double-handle in _handle_event
+            try:
                 await self._handle_event(event, connection)
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                logger.error(f"Error handling event {getattr(event, 'type', 'unknown')}: {e}", exc_info=True)
-                # Continue processing — don't let one bad event kill the loop
+                logger.error(f"Error handling event {etype}: {e}", exc_info=True)
 
     async def _handle_event(self, event, connection):
         """Handle individual events from Voice Live API."""
@@ -546,9 +654,12 @@ class VoiceSessionHandler:
                         except Exception as e:
                             logger.error(f"Failed to send proactive greeting: {e}")
 
-            # Function calls
+            # Function calls — run as a separate task so _dispatch_events is
+            # never blocked waiting for arguments, which would deadlock since
+            # _dispatch_events is the only coroutine that resolves _wait_for_event
+            # Futures.
             elif event_type == ServerEventType.CONVERSATION_ITEM_CREATED:
-                await self._handle_conversation_item(event, connection)
+                asyncio.create_task(self._handle_conversation_item(event, connection))
 
             # Errors
             elif event_type == ServerEventType.ERROR:
@@ -574,7 +685,7 @@ class VoiceSessionHandler:
             elif event_type == "response.video.delta":
                 delta = event.get("delta", "")
                 if delta:
-                    self._video_sent_count = getattr(self, '_video_sent_count', 0) + 1
+                    self._video_sent_count += 1
                     if self._video_sent_count <= 5 or self._video_sent_count % 100 == 0:
                         logger.info(f"[SEND] video_data #{self._video_sent_count}, delta_len={len(delta)}")
                     await self.send_message({
@@ -586,12 +697,29 @@ class VoiceSessionHandler:
             logger.error(f"Error handling event {getattr(event, 'type', 'unknown')}: {e}")
 
     async def _handle_conversation_item(self, event, connection):
-        """Handle function call events."""
+        """Handle conversation item events (function calls, user/assistant messages)."""
         if not hasattr(event, "item"):
             return
 
         item = event.item
-        if not (hasattr(item, "type") and item.type == ItemType.FUNCTION_CALL and hasattr(item, "call_id")):
+        # Forward user/assistant message items to the client for display
+        item_type = getattr(item, "type", None)
+        if item_type in (ItemType.MESSAGE,) or str(item_type) in ("message",):
+            role = getattr(item, "role", "unknown")
+            content_parts = getattr(item, "content", []) or []
+            text = " ".join(
+                getattr(part, "text", "") or getattr(part, "transcript", "")
+                for part in content_parts
+            ).strip()
+            if text:
+                await self.send_message({
+                    "type": "conversation_item",
+                    "role": role,
+                    "text": text,
+                })
+            return
+
+        if not (item_type == ItemType.FUNCTION_CALL and hasattr(item, "call_id")):
             return
 
         function_name = item.name
@@ -664,14 +792,15 @@ class VoiceSessionHandler:
         elif name == "calculate":
             expression = args.get("expression", "")
             try:
-                result = eval(expression, {"__builtins__": {}})
+                from simpleeval import simple_eval
+                result = simple_eval(expression)
                 return {"expression": expression, "result": str(result)}
+            except asyncio.TimeoutError:
+                return {"expression": expression, "error": "Evaluation timed out"}
             except Exception:
                 return {"expression": expression, "error": "Could not evaluate"}
         else:
             return {"error": f"Unknown function: {name}"}
-
-    _audio_chunk_count = 0
 
     async def send_audio(self, audio_base64: str):
         """Send audio data from browser to Voice Live."""
@@ -739,61 +868,70 @@ class VoiceSessionHandler:
                 logger.error(f"Error interrupting: {e}")
 
     async def update_avatar_scene(self, avatar_data: dict):
-        """Send a raw session.update with avatar scene config.
+        """Send a session.update with avatar scene config via the public SDK API.
         
-        Bypasses SDK serialization completely by writing raw JSON directly
-        to the underlying websocket, matching the JS sample's sendRawEvent approach.
-        
-        Includes input/output audio format and turn detection in the update
-        to prevent the server from resetting those fields to defaults.
+        Uses connection.session.update() with a RequestSession so the SDK handles
+        serialisation/framing — avoids the private _connection.send_str() attribute.
+        Preserves input/output audio formats and turn detection to prevent the
+        server from resetting those fields to their defaults.
         """
         if self.connection:
             try:
-                # Build session payload with avatar + preserved audio config
-                session_payload = {
-                    "avatar": avatar_data,
-                    "input_audio_format": "pcm16",
-                    "output_audio_format": "pcm16",
-                }
-
-                # Preserve turn detection config
+                # Build an AvatarConfig-compatible dict and inject it as extra fields
+                # on a minimal RequestSession so the SDK serialises it correctly.
                 td = self._build_turn_detection(self.config)
-                if hasattr(td, 'as_dict'):
-                    session_payload["turn_detection"] = td.as_dict()
-                elif hasattr(td, '__dict__'):
-                    session_payload["turn_detection"] = {k: v for k, v in td.__dict__.items() if not k.startswith('_')}
 
-                raw_event = {
-                    "type": "session.update",
-                    "session": session_payload,
-                }
-                raw_json = json.dumps(raw_event)
-                logger.info(f"[SEND] raw session.update (scene): {raw_json}")
-                await self.connection._connection.send_str(raw_json)
+                session_config = RequestSession(
+                    input_audio_format=InputAudioFormat.PCM16,
+                    output_audio_format=OutputAudioFormat.PCM16,
+                    turn_detection=td,
+                )
+                # Inject avatar data — SDK models support bracket-notation extra fields
+                try:
+                    session_config["avatar"] = avatar_data
+                except Exception:
+                    pass
+
+                raw_preview = json.dumps(avatar_data)[:120]
+                logger.info(f"[SEND] session.update (scene): avatar={raw_preview}")
+                await self.connection.session.update(session=session_config)
             except Exception as e:
                 logger.error(f"Error updating avatar scene: {e}", exc_info=True)
 
     async def stop(self):
-        """Stop the session."""
+        """Eagerly close the SDK connection and signal the pump to stop.
+
+        Calling connection.close() HERE — before task.cancel() — ensures the
+        aiohttp ClientSession and TCPConnector are shut down while the event
+        loop is still healthy.  Once task.cancel() fires the CancelledError
+        there is nothing left to close, so the leak cannot occur regardless of
+        whether the cancellation interrupts the task's finally block or the
+        event loop itself is shutting down.
+        """
         self.is_running = False
-        self.connection = None
+        conn = self.connection
+        if conn is not None:
+            try:
+                await conn.close()
+            except Exception:
+                pass
 
     async def _wait_for_event(self, connection, wanted_types: set, timeout_s: float = 15.0):
-        """Wait for specific event types."""
-        logger.info(f"[WAIT] Waiting for event types: {wanted_types}")
-        async def _next():
-            async for event in connection:
-                etype = getattr(event, 'type', 'unknown')
-                if etype != ServerEventType.RESPONSE_AUDIO_DELTA:
-                    logger.info(f"[RECV-WAIT] {etype}: {event}")
-                if event.type in wanted_types:
-                    return event
-                # Continue handling other events while waiting
-                await self._handle_event(event, connection)
-            return None
+        """Wait for a specific event type without consuming the queue directly.
 
+        Registers a one-shot asyncio.Future in self._waiters. When
+        _dispatch_events dequeues a matching event it resolves the Future
+        instead of passing the event to _handle_event, so there is no
+        double-handling and no consumer race.
+        """
+        logger.info(f"[WAIT] Waiting for event types: {wanted_types}")
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future = loop.create_future()
+        self._waiters.append((wanted_types, fut))
         try:
-            return await asyncio.wait_for(_next(), timeout=timeout_s)
+            return await asyncio.wait_for(fut, timeout=timeout_s)
         except asyncio.TimeoutError:
+            # Remove the stale waiter so _dispatch_events doesn't try to resolve it
+            self._waiters[:] = [(w, f) for w, f in self._waiters if f is not fut]
             logger.error(f"Timeout waiting for {wanted_types}")
             raise

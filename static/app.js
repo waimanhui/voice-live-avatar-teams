@@ -37,16 +37,96 @@ let playChunkAnimationFrameId = null;
 let mediaSource = null;
 let sourceBuffer = null;
 let videoChunksQueue = [];
+let videoChunkCount = 0;
 let pendingWsVideoElement = null;
+let mediaSourceObjectURL = null;  // saved so cleanupWebSocketVideo can revoke it
 
-const clientId = 'client-' + Math.random().toString(36).substr(2, 9);
+// ICE timeout IDs — stored so cleanupWebRTC can cancel them and avoid leaks
+let _icePrepareTimeoutId = null;
+let _iceSetupTimeoutId = null;
 
-// ===== DOM Ready =====
+// Accumulated assistant response text for streaming display
+let pendingAssistantText = '';
+
+// Stable-per-tab client ID (survives hot reload, cleared on tab close)
+const clientId = (() => {
+    const key = 'voicelive_client_id';
+    let id = sessionStorage.getItem(key);
+    if (!id) {
+        id = crypto.randomUUID();
+        sessionStorage.setItem(key, id);
+    }
+    return id;
+})();
+
+// ===== Settings Persistence (localStorage) =====
+const SETTINGS_KEY = 'voicelive_settings';
+// IDs of settings fields to persist (excludes credentials and server-supplied values)
+const PERSISTED_SETTINGS = [
+    'mode', 'model', 'voiceType', 'voiceName', 'voiceSpeed', 'voiceTemperature',
+    'voiceDeploymentId', 'customVoiceName', 'personalVoiceName', 'personalVoiceModel',
+    'avatarEnabled', 'isPhotoAvatar', 'isCustomAvatar', 'avatarName', 'photoAvatarName',
+    'customAvatarName', 'avatarOutputMode', 'avatarBackgroundImageUrl',
+    'useNS', 'useEC', 'turnDetectionType', 'removeFillerWords', 'srModel',
+    'recognitionLanguage', 'eouDetectionType', 'instructions', 'temperature',
+    'enableProactive', 'toolGetTime', 'toolGetWeather', 'toolCalculate',
+    'teamsDisplayName', 'sceneZoom', 'scenePositionX', 'scenePositionY',
+    'sceneRotationX', 'sceneRotationY', 'sceneRotationZ', 'sceneAmplitude',
+];
+
+function saveSettings() {
+    const saved = {};
+    for (const id of PERSISTED_SETTINGS) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (el.type === 'checkbox') {
+            saved[id] = el.checked;
+        } else if (el.tagName === 'TEXTAREA') {
+            saved[id] = el.value;
+        } else {
+            saved[id] = el.value;
+        }
+    }
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(saved));
+}
+
+function restoreSettings() {
+    let saved;
+    try { saved = JSON.parse(localStorage.getItem(SETTINGS_KEY)); } catch (_) {}
+    if (!saved) return;
+    for (const [id, val] of Object.entries(saved)) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (el.type === 'checkbox') {
+            el.checked = Boolean(val);
+        } else {
+            el.value = val;
+        }
+    }
+    // Re-sync range display labels after restoring slider values
+    ['temperature', 'voiceTemperature', 'voiceSpeed',
+     'sceneZoom', 'scenePositionX', 'scenePositionY',
+     'sceneRotationX', 'sceneRotationY', 'sceneRotationZ', 'sceneAmplitude'
+    ].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+}
 document.addEventListener('DOMContentLoaded', () => {
     setupUIBindings();
     updateConditionalFields();
     updateControlStates();
-    fetchServerConfig();
+    fetchServerConfig().then(() => {
+        restoreSettings();
+        updateConditionalFields();
+        updateControlStates();
+    });
+    // Persist settings on any input/change event within the sidebar
+    const sidebar = document.getElementById('sidebar');
+    if (sidebar) {
+        sidebar.addEventListener('input', saveSettings);
+        sidebar.addEventListener('change', saveSettings);
+    }
 });
 
 // ===== Server Config =====
@@ -59,6 +139,15 @@ async function fetchServerConfig() {
         if (config.model) document.getElementById('model').value = config.model;
         if (config.voice) document.getElementById('voiceName').value = config.voice;
         if (config.teamsMeetingLink) document.getElementById('teamsMeetingLink').value = config.teamsMeetingLink;
+        // Warn if ACS is not configured so Teams joining will fail at token fetch time
+        if (config.acsConfigured === false) {
+            const teamsStatus = document.getElementById('teamsStatus');
+            if (teamsStatus) {
+                teamsStatus.textContent = 'ACS not configured on server — Teams calling unavailable. Set AZURE_COMMUNICATION_CONNECTION_STRING in .env.';
+                teamsStatus.style.display = 'block';
+                teamsStatus.style.color = '#c00';
+            }
+        }
     } catch (e) {
         console.log('No server config available, using defaults');
     }
@@ -194,7 +283,7 @@ function updateConditionalFields() {
     const model = document.getElementById('model').value;
     const voiceType = document.getElementById('voiceType').value;
     const voiceName = document.getElementById('voiceName').value;
-    const avatarEnabled = document.getElementById('avatarEnabled').checked;
+    const avatarEnabledChecked = document.getElementById('avatarEnabled').checked;
     const isPhotoAvatar = document.getElementById('isPhotoAvatar').checked;
     const isCustomAvatar = document.getElementById('isCustomAvatar').checked;
     const turnDetectionType = document.getElementById('turnDetectionType').value;
@@ -239,7 +328,7 @@ function updateConditionalFields() {
     show('voiceTempField', isDragonHD || isPersonal);
 
     // Avatar settings
-    show('avatarSettings', avatarEnabled);
+    show('avatarSettings', avatarEnabledChecked);
     show('standardAvatarField', !isPhotoAvatar && !isCustomAvatar);
     show('photoAvatarField', isPhotoAvatar && !isCustomAvatar);
     show('customAvatarField', isCustomAvatar);
@@ -355,6 +444,12 @@ function gatherConfig() {
         agentId: document.getElementById('agentId').value,
         agentName: document.getElementById('agentName').value,
         agentProjectName: document.getElementById('agentProjectName').value,
+        // Tool toggles
+        tools: [
+            ...(document.getElementById('toolGetTime')?.checked ? ['get_time'] : []),
+            ...(document.getElementById('toolGetWeather')?.checked ? ['get_weather'] : []),
+            ...(document.getElementById('toolCalculate')?.checked ? ['calculate'] : []),
+        ],
     };
 
     // Photo avatar scene settings
@@ -397,10 +492,6 @@ async function connectSession() {
     const apiKey = document.getElementById('apiKey')?.value.trim();
     const entraToken = document.getElementById('entraToken')?.value.trim();
 
-    if (!isAgent && !apiKey) {
-        addMessage('system', 'Please enter Subscription Key');
-        return;
-    }
     if (isAgent && !entraToken) {
         addMessage('system', 'Please enter Entra ID Token');
         return;
@@ -573,6 +664,34 @@ function handleServerMessage(msg) {
         case 'video_data':
             handleVideoChunk(msg.delta);
             break;
+        case 'stop_playback':
+            // Server interrupted playback (e.g. barge-in) — flush local buffers
+            stopAudioPlayback();
+            isSpeaking = false;
+            addMessage('system', '[Playback stopped' + (msg.reason ? ': ' + msg.reason : '') + ']', true);
+            break;
+        case 'function_call_started':
+            addMessage('system', `[Tool] ${msg.functionName} called (id: ${msg.callId})`, true);
+            break;
+        case 'function_call_result':
+            addMessage('system', `[Tool] ${msg.functionName} → ${JSON.stringify(msg.result)}`, true);
+            break;
+        case 'function_call_error':
+            addMessage('system', `[Tool] ${msg.functionName} error: ${msg.error}`, true);
+            break;
+        case 'audio_done':
+            // Server audio output complete for this turn
+            addMessage('system', '[Audio done]', true);
+            break;
+        case 'error':
+            addMessage('system', 'Server error: ' + (msg.error || msg.message || 'Unknown error'));
+            break;
+        case 'conversation_item':
+            // User/assistant text items forwarded by the backend
+            if (msg.role === 'assistant' && msg.text) {
+                addMessage('assistant', msg.text);
+            }
+            break;
         default:
             // Log unknown events in dev mode
             if (isDeveloperMode) {
@@ -580,8 +699,6 @@ function handleServerMessage(msg) {
             }
     }
 }
-
-let pendingAssistantText = '';
 
 function onAssistantDelta(text) {
     pendingAssistantText += text;
@@ -1174,7 +1291,8 @@ function setupWebSocketVideoPlayback(isPhotoAvatar) {
     }
 
     mediaSource = new MediaSource();
-    videoElement.src = URL.createObjectURL(mediaSource);
+    mediaSourceObjectURL = URL.createObjectURL(mediaSource);
+    videoElement.src = mediaSourceObjectURL;
 
     mediaSource.addEventListener('sourceopen', () => {
         try {
@@ -1197,8 +1315,6 @@ function setupWebSocketVideoPlayback(isPhotoAvatar) {
     }
 }
 
-let videoChunkCount = 0;
-
 function handleVideoChunk(base64Data) {
     if (!base64Data) return;
     videoChunkCount++;
@@ -1206,13 +1322,15 @@ function handleVideoChunk(base64Data) {
         console.log(`[VIDEO] chunk #${videoChunkCount}, length=${base64Data.length}, mediaSource=${mediaSource?.readyState}, sourceBuffer=${!!sourceBuffer}`);
     }
     try {
-        const binaryString = atob(base64Data);
-        const arrayBuffer = new ArrayBuffer(binaryString.length);
-        const bytes = new Uint8Array(arrayBuffer);
-        for (let i = 0; i < binaryString.length; i++) {
-            bytes[i] = binaryString.charCodeAt(i);
+        videoChunksQueue.push(base64ToArrayBuffer(base64Data));
+        // Cap the queue to prevent unbounded memory growth when the SourceBuffer
+        // is temporarily busy (e.g. slow device or long network stall).
+        const MAX_VIDEO_QUEUE = 300;
+        if (videoChunksQueue.length > MAX_VIDEO_QUEUE) {
+            const dropped = videoChunksQueue.length - MAX_VIDEO_QUEUE;
+            videoChunksQueue.splice(0, dropped);
+            console.warn(`[VIDEO] Queue overflow — dropped ${dropped} stale chunk(s)`);
         }
-        videoChunksQueue.push(arrayBuffer);
         processVideoChunkQueue();
     } catch (e) {
         console.error('Error handling video chunk:', e);
@@ -1234,6 +1352,7 @@ function processVideoChunkQueue() {
 
 function cleanupWebSocketVideo() {
     videoChunksQueue = [];
+    videoChunkCount = 0;
     if (sourceBuffer && mediaSource) {
         try {
             if (mediaSource.readyState === 'open' && !sourceBuffer.updating) {
@@ -1245,6 +1364,10 @@ function cleanupWebSocketVideo() {
     }
     sourceBuffer = null;
     mediaSource = null;
+    if (mediaSourceObjectURL) {
+        URL.revokeObjectURL(mediaSourceObjectURL);
+        mediaSourceObjectURL = null;
+    }
     pendingWsVideoElement = null;
 }
 
@@ -1294,12 +1417,17 @@ function preparePeerConnection(iceServers) {
     const pc = new RTCPeerConnection({ iceServers: iceConfig });
     let iceGatheringDone = false;
 
-    // Wire up track handler (video → avatar display + Teams bridge; audio → Teams bridge)
-    _setupPCOntrack(pc, document.getElementById('avatarVideo'));
+    // NOTE: do NOT call _setupPCOntrack here — the #avatarVideo container
+    // reference would be stale by the time this PC is actually dequeued
+    // and used. _setupPCOntrack is called in setupWebRTC() instead.
 
     pc.onicecandidate = (event) => {
         if (!event.candidate && !iceGatheringDone) {
             iceGatheringDone = true;
+            if (_icePrepareTimeoutId !== null) {
+                clearTimeout(_icePrepareTimeoutId);
+                _icePrepareTimeoutId = null;
+            }
             peerConnectionQueue.push(pc);
             console.log('[' + new Date().toISOString() + '] ICE gathering done, new peer connection prepared.');
             // Keep only the latest prepared connection
@@ -1330,7 +1458,8 @@ function preparePeerConnection(iceServers) {
         return pc.setLocalDescription(offer);
     }).then(() => {
         // Timeout fallback: if ICE gathering hasn't completed after 10 seconds, push anyway
-        setTimeout(() => {
+        _icePrepareTimeoutId = setTimeout(() => {
+            _icePrepareTimeoutId = null;
             if (!iceGatheringDone) {
                 iceGatheringDone = true;
                 peerConnectionQueue.push(pc);
@@ -1360,6 +1489,9 @@ function setupWebRTC(iceServers) {
         // Use cached peer connection with pre-gathered ICE candidates
         peerConnection = peerConnectionQueue.shift();
         console.log('[' + new Date().toISOString() + '] Using cached peer connection with pre-gathered ICE candidates.');
+
+        // Wire track handler now against the live container (not the stale prep-time one)
+        _setupPCOntrack(peerConnection, container);
 
         // Send SDP offer immediately (no need to wait for ICE gathering)
         const sdpJson = JSON.stringify(peerConnection.localDescription);
@@ -1418,7 +1550,8 @@ function setupWebRTC(iceServers) {
         return peerConnection.setLocalDescription(offer);
     }).then(() => {
         // Timeout fallback: send SDP after 10 seconds if ICE gathering hasn't completed
-        setTimeout(() => {
+        _iceSetupTimeoutId = setTimeout(() => {
+            _iceSetupTimeoutId = null;
             if (!iceGatheringDone) {
                 iceGatheringDone = true;
                 const sdpJson = JSON.stringify(peerConnection.localDescription);
@@ -1454,6 +1587,16 @@ function handleAvatarSdpAnswer(serverSdpBase64) {
 }
 
 function cleanupWebRTC() {
+    // Cancel any pending ICE timeout timers
+    if (_icePrepareTimeoutId !== null) {
+        clearTimeout(_icePrepareTimeoutId);
+        _icePrepareTimeoutId = null;
+    }
+    if (_iceSetupTimeoutId !== null) {
+        clearTimeout(_iceSetupTimeoutId);
+        _iceSetupTimeoutId = null;
+    }
+
     // Stop the canvas draw loop immediately so the rAF chain dies.
     if (_teamsCanvasSrcVideo) {
         _teamsCanvasSrcVideo._teamsActive = false;
@@ -1520,6 +1663,16 @@ function onSpeechStarted(itemId) {
     isSpeaking = true;
     // Stop assistant audio playback (barge-in) in speech-only mode
     stopAudioPlayback();
+    // For WebSocket avatar mode: fully reset the MediaSource pipeline so the
+    // stale decoder state is torn down and the video element stops rendering
+    // the old response.  Simply clearing the queue is not enough — the
+    // SourceBuffer may already have decoded frames queued in the browser's
+    // media pipeline.  Reinitialising forces a clean slate.
+    if (avatarOutputMode === 'websocket') {
+        const isPhoto = document.getElementById('avatarType')?.value === 'photo';
+        cleanupWebSocketVideo();
+        setupWebSocketVideoPlayback(isPhoto);
+    }
     // Add user placeholder message (will be updated when transcription completes)
     if (itemId) {
         const contentDiv = addMessage('user', '...');
@@ -1536,19 +1689,20 @@ function onSpeechStopped() {
 
 // ===== Utilities =====
 function arrayBufferToBase64(buffer) {
+    // Process in 8 kB chunks to avoid call-stack overflow on large buffers
     const bytes = new Uint8Array(buffer);
+    const CHUNK = 8192;
     let binary = '';
-    for (let i = 0; i < bytes.byteLength; i++) {
-        binary += String.fromCharCode(bytes[i]);
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
     }
     return btoa(binary);
 }
 
 function base64ToArrayBuffer(base64) {
     const binary = atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
         bytes[i] = binary.charCodeAt(i);
     }
     return bytes.buffer;
@@ -1616,6 +1770,46 @@ let _teamsAvatarVideoTrack = null; // The WebRTC video track being sent to Teams
 let _teamsVideoPending = false;    // true when checkbox checked but track not yet available
 let _teamsCanvasSrcVideo = null;   // Hidden <video> used for canvas reframing
 let _teamsCanvas = null;           // Offscreen <canvas> for 16:9 reframe
+let _teamsCanvasIntervalId = null; // setInterval id for background-safe canvas draw loop
+let _teamsSilentOsc = null;        // OscillatorNode kept alive until leave — must be stopped explicitly
+let _teamsTokenCredential = null;  // AzureCommunicationTokenCredential — kept for token refresh
+let _teamsTokenRefreshTimer = null; // setTimeout id for proactive token refresh
+let _teamsFileAudioCtx = null;     // AudioContext used for file-source audio bridging
+let _teamsFileBufferSource = null; // BufferSourceNode for file-source audio bridging
+let teamsAudioChunkQueue = [];     // PCM chunks buffered while VoiceLive session is not yet open
+let _teamsUserId = null;           // ACS user identity (saved so we can delete it after the call)
+let _remoteAudioStreamsHandler = null; // named handler ref so we can call .off() with same reference
+
+/**
+ * Schedules a proactive ACS token refresh 5 minutes before the token expires.
+ * Calls /api/acs-token and updates the credential via updateToken() so the
+ * active call is not interrupted by token expiry (~1 hour default lifetime).
+ */
+function _scheduleTeamsTokenRefresh(tokenData) {
+    if (_teamsTokenRefreshTimer) {
+        clearTimeout(_teamsTokenRefreshTimer);
+        _teamsTokenRefreshTimer = null;
+    }
+    if (!tokenData?.expiresOn) return;
+    const expiresMs = new Date(tokenData.expiresOn).getTime();
+    const refreshAt = expiresMs - Date.now() - 5 * 60 * 1000; // 5 min before expiry
+    if (refreshAt <= 0) return; // already expired or too close
+    _teamsTokenRefreshTimer = setTimeout(async () => {
+        try {
+            addMessage('system', '[Teams] Refreshing ACS token...', true);
+            const resp = await fetch('/api/acs-token');
+            if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+            const data = await resp.json();
+            if (_teamsTokenCredential) {
+                _teamsTokenCredential.updateToken(data.token);
+                addMessage('system', '[Teams] ACS token refreshed ✓', true);
+            }
+            _scheduleTeamsTokenRefresh(data); // schedule next refresh
+        } catch (e) {
+            addMessage('system', `[Teams] Token refresh failed: ${e.message}`, true);
+        }
+    }, Math.max(refreshAt, 0));
+}
 
 function setTeamsStatus(msg, isError = false) {
     const el = document.getElementById('teamsStatus');
@@ -1650,7 +1844,9 @@ async function joinTeamsMeeting() {
             const err = await tokenResp.json();
             throw new Error(err.detail || 'Failed to get ACS token');
         }
-        const { userId, token } = await tokenResp.json();
+        const tokenData = await tokenResp.json();
+        const { userId, token } = tokenData;
+        _teamsUserId = userId;
         addMessage('system', `[Teams] ACS token issued for user: ${userId}`, true);
 
         setTeamsStatus('Initializing ACS call client...');
@@ -1660,11 +1856,13 @@ async function joinTeamsMeeting() {
             AzureCommunicationCalling;
 
         teamsCallClient = new CallClient();
-        const tokenCredential = new AzureCommunicationTokenCredential(token);
+        _teamsTokenCredential = new AzureCommunicationTokenCredential(token);
         teamsCallAgent = await teamsCallClient.createCallAgent(
-            tokenCredential,
+            _teamsTokenCredential,
             { displayName }
         );
+        // Schedule proactive token refresh 5 minutes before expiry
+        _scheduleTeamsTokenRefresh(tokenData);
 
         setTeamsStatus('Joining Teams meeting...');
 
@@ -1692,12 +1890,12 @@ async function joinTeamsMeeting() {
         // When the avatar starts speaking, _bridgeAvatarAudioToTeams() disconnects the
         // silent gain and connects captureNode — all within the same AudioContext.
         _teamsBridgeDest = playbackContext.createMediaStreamDestination();
-        const silentOsc = playbackContext.createOscillator();
+        _teamsSilentOsc = playbackContext.createOscillator();
         _teamsBridgeSilentGain = playbackContext.createGain();
         _teamsBridgeSilentGain.gain.value = 0;
-        silentOsc.connect(_teamsBridgeSilentGain);
+        _teamsSilentOsc.connect(_teamsBridgeSilentGain);
         _teamsBridgeSilentGain.connect(_teamsBridgeDest);
-        silentOsc.start();
+        _teamsSilentOsc.start();
 
         const silentStream = new AzureCommunicationCalling.LocalAudioStream(
             _teamsBridgeDest.stream
@@ -1790,9 +1988,11 @@ async function _bridgeWebRTCVideoToTeams(videoTrack) {
 }
 
 /** Start sending the cached avatar video track into the active Teams call.
- *  The raw track is reframed onto a 16:9 canvas (960×540) so Teams shows the
+ *  The raw track is reframed onto a configurable canvas so Teams shows the
  *  full avatar without cropping. The avatar is scaled to fit (contain) and
  *  centred on a white background.
+ *  Draw loop uses setInterval (not requestAnimationFrame) so it keeps running
+ *  when the tab is backgrounded.
  */
 async function _startTeamsVideo() {
     if (!teamsCall || teamsCall.state !== 'Connected') return;
@@ -1803,7 +2003,10 @@ async function _startTeamsVideo() {
     if (_teamsLocalVideoStream) return;  // already sending
 
     try {
-        const OUT_W = 960, OUT_H = 540;  // 16:9
+        // Read resolution/fps from UI, fall back to defaults
+        const OUT_W = parseInt(document.getElementById('teamsVideoWidth')?.value)  || 960;
+        const OUT_H = parseInt(document.getElementById('teamsVideoHeight')?.value) || 540;
+        const OUT_FPS = parseInt(document.getElementById('teamsVideoFps')?.value)  || 25;
 
         // Hidden video element to read pixels from the WebRTC track
         const srcVideo = document.createElement('video');
@@ -1826,13 +2029,22 @@ async function _startTeamsVideo() {
         const canvas = document.createElement('canvas');
         canvas.width  = OUT_W;
         canvas.height = OUT_H;
-        const ctx = canvas.getContext('2d');
+        // alpha:false skips alpha compositing — reduces per-frame CPU cost so
+        // the encoder gets frames faster and ramp-up is quicker.
+        const ctx = canvas.getContext('2d', { alpha: false });
 
-        // Use a flag on srcVideo itself so the loop can check it after cleanup
-        srcVideo._teamsActive = true;
+        // Use setInterval instead of requestAnimationFrame so the draw loop
+        // keeps running when the tab is in the background (rAF is throttled).
+        // Warn once if the tab goes hidden — browsers may throttle setInterval on hidden tabs too.
+        const _onVisibilityChange = () => {
+            if (document.hidden) {
+                addMessage('system', '[Teams] Tab is hidden — canvas draw loop may be throttled by the browser; Teams video quality may degrade.', true);
+            }
+        };
+        document.addEventListener('visibilitychange', _onVisibilityChange, { once: true });
 
-        function drawFrame() {
-            if (!srcVideo._teamsActive) return;  // stopped — exit loop
+        _teamsCanvasIntervalId = setInterval(() => {
+            if (!srcVideo.parentNode) { clearInterval(_teamsCanvasIntervalId); _teamsCanvasIntervalId = null; return; }
             ctx.fillStyle = '#ffffff';
             ctx.fillRect(0, 0, OUT_W, OUT_H);
             const sw = srcVideo.videoWidth  || OUT_W;
@@ -1841,14 +2053,30 @@ async function _startTeamsVideo() {
             const dw = sw * scale;
             const dh = sh * scale;
             ctx.drawImage(srcVideo, (OUT_W - dw) / 2, (OUT_H - dh) / 2, dw, dh);
-            requestAnimationFrame(drawFrame);
-        }
-        drawFrame();
+        }, Math.round(1000 / OUT_FPS));
 
-        // Give canvas one rAF tick to paint before handing stream to ACS
-        await new Promise(r => requestAnimationFrame(r));
+        // Wait for srcVideo to decode and paint at least one real frame into the
+        // canvas before captureStream() so the first encoded frame is a complete
+        // I-frame rather than a blank keyframe, which helps Teams ramp up faster.
+        await new Promise(resolve => {
+            if ('requestVideoFrameCallback' in srcVideo) {
+                srcVideo.requestVideoFrameCallback(() => {
+                    // Draw the first real frame synchronously before resolving
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillRect(0, 0, OUT_W, OUT_H);
+                    const sw = srcVideo.videoWidth  || OUT_W;
+                    const sh = srcVideo.videoHeight || OUT_H;
+                    const scale = Math.min(OUT_W / sw, OUT_H / sh);
+                    ctx.drawImage(srcVideo, (OUT_W - sw * scale) / 2, (OUT_H - sh * scale) / 2, sw * scale, sh * scale);
+                    resolve();
+                });
+            } else {
+                // Fallback: wait one interval tick
+                setTimeout(resolve, Math.round(1000 / OUT_FPS));
+            }
+        });
 
-        const canvasStream = canvas.captureStream(25);
+        const canvasStream = canvas.captureStream(OUT_FPS);
         const { LocalVideoStream } = AzureCommunicationCalling;
         _teamsLocalVideoStream = new LocalVideoStream(canvasStream);
 
@@ -1857,7 +2085,7 @@ async function _startTeamsVideo() {
         _teamsCanvas = canvas;
 
         await teamsCall.startVideo(_teamsLocalVideoStream);
-        addMessage('system', `[Teams] Avatar video started ✓ (${srcVideo.videoWidth}×${srcVideo.videoHeight} → ${OUT_W}×${OUT_H})`, true);
+        addMessage('system', `[Teams] Avatar video started ✓ (${srcVideo.videoWidth}×${srcVideo.videoHeight} → ${OUT_W}×${OUT_H} @ ${OUT_FPS}fps)`, true);
         setTeamsStatus('Teams: Connected ✓ (audio + video)');
     } catch (e) {
         addMessage('system', `[Teams] startVideo error: ${e.message}`, true);
@@ -1868,9 +2096,10 @@ async function _startTeamsVideo() {
 /** Stop sending avatar video to Teams and clean up canvas resources. */
 async function _stopTeamsVideo() {
     if (!teamsCall || !_teamsLocalVideoStream) return;
-    // Stop the draw loop first
-    if (_teamsCanvasSrcVideo) {
-        _teamsCanvasSrcVideo._teamsActive = false;
+    // Stop the draw loop
+    if (_teamsCanvasIntervalId) {
+        clearInterval(_teamsCanvasIntervalId);
+        _teamsCanvasIntervalId = null;
     }
     try {
         await teamsCall.stopVideo(_teamsLocalVideoStream);
@@ -1991,9 +2220,14 @@ async function _bridgeAvatarAudioToTeams() {
     addMessage('system', `[Teams] Setting up audio bridge: source=${source}`, true);
 
     // Tear down any previous file-playback context
-    if (window._teamsFileAudioCtx) {
-        try { window._teamsFileAudioCtx.close(); } catch (_) {}
-        window._teamsFileAudioCtx = null;
+    if (_teamsFileAudioCtx) {
+        try { _teamsFileAudioCtx.close(); } catch (_) {}
+        _teamsFileAudioCtx = null;
+    }
+    // Stop any previous file buffer source node
+    if (_teamsFileBufferSource) {
+        try { _teamsFileBufferSource.stop(); _teamsFileBufferSource.disconnect(); } catch (_) {}
+        _teamsFileBufferSource = null;
     }
     // Tear down previous avatar bridge node
     if (playbackContext?._teamsBridgeNode) {
@@ -2009,27 +2243,52 @@ async function _bridgeAvatarAudioToTeams() {
             const fileInput = document.getElementById('teamsAudioFile');
             if (!fileInput?.files?.length) {
                 setTeamsStatus('Select an audio file first.', true);
+                _teamsBridging = false;
                 return;
             }
             const loop = document.getElementById('teamsAudioLoop')?.checked ?? true;
             const arrayBuffer = await fileInput.files[0].arrayBuffer();
 
-            const fileCtx = new AudioContext();
-            window._teamsFileAudioCtx = fileCtx;
-            const audioBuffer = await fileCtx.decodeAudioData(arrayBuffer);
+            // Decode through playbackContext (24 kHz) to avoid sample-rate mismatch.
+            // playbackContext is guaranteed to exist at this point (created during joinTeamsMeeting).
+            const audioBuffer = await playbackContext.decodeAudioData(arrayBuffer);
 
-            const fileDest = fileCtx.createMediaStreamDestination();
-            const fileSource = fileCtx.createBufferSource();
+            // Tear down any previous bridge node before rebuilding
+            if (playbackContext._teamsBridgeNode) {
+                try { playbackContext._teamsBridgeNode.disconnect(); } catch (_) {}
+                playbackContext._teamsBridgeNode = null;
+            }
+            if (_teamsBridgeSilentGain) {
+                try { _teamsBridgeSilentGain.disconnect(_teamsBridgeDest); } catch (_) {}
+                _teamsBridgeSilentGain = null;
+            }
+
+            // Reconnect silent oscillator so the Teams audio track stays live
+            // while we decode and start the new file source node.
+            if (_teamsSilentOsc && _teamsBridgeDest) {
+                const tmpGain = playbackContext.createGain();
+                tmpGain.gain.value = 0;
+                _teamsBridgeSilentGain = tmpGain;
+                _teamsSilentOsc.connect(tmpGain);
+                tmpGain.connect(_teamsBridgeDest);
+            }
+
+            const fileSource = playbackContext.createBufferSource();
             fileSource.buffer = audioBuffer;
             fileSource.loop = loop;
-            fileSource.connect(fileDest);
+            // Disconnect temp silent gain now that real audio is about to start
+            if (_teamsBridgeSilentGain) {
+                try { _teamsBridgeSilentGain.disconnect(_teamsBridgeDest); } catch (_) {}
+                _teamsBridgeSilentGain = null;
+            }
+            fileSource.connect(_teamsBridgeDest);
             fileSource.start(0);
-            // Restart when file ends if loop is off, just let it stop
             fileSource.onended = () => {
                 if (!loop) addMessage('system', '[Teams] Audio file playback ended', true);
             };
-
-            mediaTrack = fileDest.stream.getAudioTracks()[0];
+            // Store source so it can be stopped on re-bridge or leave
+            _teamsFileBufferSource = fileSource;
+            _teamsBridging = false;
             setTeamsStatus(`Teams: Connected ✓ (file: ${fileInput.files[0].name})`);
 
         } else {
@@ -2096,14 +2355,6 @@ async function _bridgeAvatarAudioToTeams() {
             return;
         }
 
-        if (!mediaTrack) throw new Error('Could not obtain audio track for Teams');
-
-        const bridgeStream = new AzureCommunicationCalling.LocalAudioStream(
-            new MediaStream([mediaTrack])
-        );
-        await teamsCall.startAudio(bridgeStream);
-        _teamsBridging = false;
-
     } catch (e) {
         _teamsBridging = false;
         console.warn('Teams audio bridge error:', e);
@@ -2112,24 +2363,25 @@ async function _bridgeAvatarAudioToTeams() {
     }
 }
 
-async function leaveTeamsMeeting() {
-    document.getElementById('teamsLeaveBtn').style.display = 'none';
-    document.getElementById('teamsJoinBtn').style.display = 'inline-flex';
-    if (teamsCall) {
-        try { await teamsCall.hangUp(); } catch (_) {}
-        teamsCall = null;
+/**
+ * Shared teardown of all Teams bridge state.
+ * Called by both leaveTeamsMeeting() and _onTeamsDisconnected().
+ */
+function _cleanupTeamsState() {
+    // Cancel scheduled token refresh
+    if (_teamsTokenRefreshTimer) {
+        clearTimeout(_teamsTokenRefreshTimer);
+        _teamsTokenRefreshTimer = null;
     }
-    if (teamsCallAgent) {
-        try { await teamsCallAgent.dispose(); } catch (_) {}
-        teamsCallAgent = null;
+    _teamsTokenCredential = null;
+
+    // Stop silent oscillator
+    if (_teamsSilentOsc) {
+        try { _teamsSilentOsc.stop(); } catch (_) {}
+        _teamsSilentOsc = null;
     }
-    teamsCallClient = null;
-    // Clean up file audio context if active
-    if (window._teamsFileAudioCtx) {
-        try { window._teamsFileAudioCtx.close(); } catch (_) {}
-        window._teamsFileAudioCtx = null;
-    }
-    // Tear down avatar bridge
+
+    // Tear down avatar audio bridge
     if (playbackContext?._webrtcBridgeSource) {
         try { playbackContext._webrtcBridgeSource.disconnect(); } catch (_) {}
         playbackContext._webrtcBridgeSource = null;
@@ -2138,43 +2390,12 @@ async function leaveTeamsMeeting() {
         try { playbackContext._teamsBridgeNode.disconnect(); } catch (_) {}
         playbackContext._teamsBridgeNode = null;
     }
-    // Stop canvas draw loop and clean up video reframe resources
-    if (_teamsCanvasSrcVideo) {
-        _teamsCanvasSrcVideo._teamsActive = false;
-        try { _teamsCanvasSrcVideo.pause(); } catch (_) {}
-        _teamsCanvasSrcVideo.remove();
-    }
-    _teamsLocalVideoStream = null;
-    _teamsAvatarVideoTrack = null;
-    _teamsVideoPending = false;
-    _teamsCanvasSrcVideo = null;
-    _teamsCanvas = null;
-    const videoChk = document.getElementById('teamsSendVideo');
-    if (videoChk) videoChk.checked = false;
-    _teamsBridgeDest = null;
-    _teamsBridgeSilentGain = null;
-    _teamsBridging = false;
-    // If Voice Live is not active, close the shared playbackContext now
-    if (!isConnected && playbackContext) {
-        try { playbackContext.close(); } catch (_) {}
-        playbackContext = null;
-        analyserNode = null;
-        analyserDataArray = null;
-    }
-    setTeamsStatus('');
-    addMessage('system', '[Teams] Left meeting', true);
-    stopTeamsAudioCapture();
-    document.getElementById('teamsJoinBtn').disabled = false;
-}
 
-function _onTeamsDisconnected() {
-    teamsCall = null;
-    document.getElementById('teamsJoinBtn').style.display = 'inline-flex';
-    document.getElementById('teamsLeaveBtn').style.display = 'none';
-    document.getElementById('teamsJoinBtn').disabled = false;
-    addMessage('system', '[Teams] Disconnected', true);
-    stopTeamsAudioCapture();
-    // Tear down video reframe resources (same as leaveTeamsMeeting)
+    // Stop canvas draw loop and clean up video reframe resources
+    if (_teamsCanvasIntervalId) {
+        clearInterval(_teamsCanvasIntervalId);
+        _teamsCanvasIntervalId = null;
+    }
     if (_teamsCanvasSrcVideo) {
         _teamsCanvasSrcVideo._teamsActive = false;
         try { _teamsCanvasSrcVideo.pause(); } catch (_) {}
@@ -2187,9 +2408,87 @@ function _onTeamsDisconnected() {
     _teamsVideoPending = false;
     const videoChk = document.getElementById('teamsSendVideo');
     if (videoChk) videoChk.checked = false;
+    _teamsBridgeDest = null;
+    _teamsBridgeSilentGain = null;
+    _teamsBridging = false;
+    teamsAutoConnected = false;
+    teamsAudioChunkQueue = [];
+
+    // Clean up file audio context if active
+    if (_teamsFileAudioCtx) {
+        try { _teamsFileAudioCtx.close(); } catch (_) {}
+        _teamsFileAudioCtx = null;
+    }
+    if (_teamsFileBufferSource) {
+        try { _teamsFileBufferSource.stop(); _teamsFileBufferSource.disconnect(); } catch (_) {}
+        _teamsFileBufferSource = null;
+    }
+
+    // If Voice Live is not active, close the shared playbackContext now
+    if (!isConnected && playbackContext) {
+        try { playbackContext.close(); } catch (_) {}
+        playbackContext = null;
+        analyserNode = null;
+        analyserDataArray = null;
+    }
+
+    stopTeamsAudioCapture();
+}
+
+async function leaveTeamsMeeting() {
+    document.getElementById('teamsLeaveBtn').style.display = 'none';
+    document.getElementById('teamsJoinBtn').style.display = 'inline-flex';
+
+    if (teamsCall) {
+        try { await teamsCall.hangUp(); } catch (_) {}
+        teamsCall = null;
+    }
+    if (teamsCallAgent) {
+        try { await teamsCallAgent.dispose(); } catch (_) {}
+        teamsCallAgent = null;
+    }
+    teamsCallClient = null;
+
+    _cleanupTeamsState();
+    setTeamsStatus('');
+    addMessage('system', '[Teams] Left meeting', true);
+    document.getElementById('teamsJoinBtn').disabled = false;
+
+    // Delete the ephemeral ACS identity so it doesn't accumulate in the resource
+    if (_teamsUserId) {
+        const idToDelete = _teamsUserId;
+        _teamsUserId = null;
+        fetch('/api/acs-delete-user', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: idToDelete }),
+        }).catch(e => console.warn('[Teams] ACS identity delete error:', e));
+    }
+}
+
+function _onTeamsDisconnected() {
+    teamsCall = null;
+    document.getElementById('teamsJoinBtn').style.display = 'inline-flex';
+    document.getElementById('teamsLeaveBtn').style.display = 'none';
+    document.getElementById('teamsJoinBtn').disabled = false;
+    addMessage('system', '[Teams] Disconnected', true);
+
     if (teamsCallAgent) {
         teamsCallAgent.dispose().catch(() => {});
         teamsCallAgent = null;
+    }
+
+    _cleanupTeamsState();
+
+    // Delete the ephemeral ACS identity so it doesn't accumulate in the resource
+    if (_teamsUserId) {
+        const idToDelete = _teamsUserId;
+        _teamsUserId = null;
+        fetch('/api/acs-delete-user', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ userId: idToDelete }),
+        }).catch(e => console.warn('[Teams] ACS identity delete error:', e));
     }
 }
 
@@ -2210,16 +2509,26 @@ async function startTeamsAudioCapture() {
     try {
         addMessage('system', '[Teams→AI] Getting remote audio stream...', true);
 
-        // Get the mixed incoming audio MediaStream from ACS
+        // Get the mixed incoming audio MediaStream from ACS.
+        // Register a permanent remoteAudioStreamsUpdated listener so that if the
+        // stream is removed and replaced later (e.g. participant rejoins) the
+        // capture is automatically re-attached.  The handler is cleaned up in
+        // stopTeamsAudioCapture() via teamsCall.off().
+        if (_remoteAudioStreamsHandler) {
+            teamsCall.off('remoteAudioStreamsUpdated', _remoteAudioStreamsHandler);
+        }
+        _remoteAudioStreamsHandler = async ({ added }) => {
+            if (added.length > 0) {
+                addMessage('system', '[Teams→AI] Remote audio stream replaced — re-attaching...', true);
+                stopTeamsAudioCapture(/* keepListener= */ true);
+                await _attachTeamsIncomingStream(added[0]);
+            }
+        };
+        teamsCall.on('remoteAudioStreamsUpdated', _remoteAudioStreamsHandler);
+
         const remoteStreams = teamsCall.remoteAudioStreams;
         if (!remoteStreams || remoteStreams.length === 0) {
-            addMessage('system', '[Teams→AI] No remote streams yet, subscribing to remoteAudioStreamsUpdated...', true);
-            teamsCall.on('remoteAudioStreamsUpdated', async ({ added }) => {
-                if (added.length > 0) {
-                    teamsCall.off('remoteAudioStreamsUpdated', () => {});
-                    await _attachTeamsIncomingStream(added[0]);
-                }
-            });
+            addMessage('system', '[Teams→AI] No remote streams yet — will attach when remoteAudioStreamsUpdated fires...', true);
             return;
         }
         await _attachTeamsIncomingStream(remoteStreams[0]);
@@ -2238,6 +2547,18 @@ async function _attachTeamsIncomingStream(remoteAudioStream) {
     const tracks = mediaStream.getAudioTracks();
     addMessage('system', `[Teams→AI] MediaStream obtained — ${tracks.length} audio track(s)`, true);
 
+    // Request echo cancellation on the incoming track where the browser supports it.
+    // This prevents the AI's own outgoing voice (heard by remote participants and
+    // looped back through Teams) from feeding back into the Voice Live input.
+    if (tracks.length > 0) {
+        try {
+            await tracks[0].applyConstraints({ echoCancellation: true, noiseSuppression: true });
+            addMessage('system', '[Teams→AI] Echo cancellation + noise suppression applied to remote track', true);
+        } catch (e) {
+            addMessage('system', `[Teams→AI] applyConstraints skipped: ${e.message}`, true);
+        }
+    }
+
     // Build an AudioContext → AudioWorklet pipeline identical to startAudioCapture()
     teamsInAudioCtx = new AudioContext({ sampleRate: 24000 });
 
@@ -2246,8 +2567,21 @@ async function _attachTeamsIncomingStream(remoteAudioStream) {
 
     let chunkCount = 0;
     teamsInWorkletNode.port.onmessage = (e) => {
-        if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) return;
         const base64 = arrayBufferToBase64(e.data);
+        // If VoiceLive session is not yet open, buffer chunks and drain once connected
+        if (!isConnected || !ws || ws.readyState !== WebSocket.OPEN) {
+            teamsAudioChunkQueue.push(base64);
+            // Cap queue at ~5 seconds of audio (5000ms / 20ms per chunk ≈ 250 chunks)
+            if (teamsAudioChunkQueue.length > 250) teamsAudioChunkQueue.shift();
+            return;
+        }
+        // Drain any buffered chunks first
+        if (teamsAudioChunkQueue.length > 0) {
+            for (const buffered of teamsAudioChunkQueue) {
+                ws.send(JSON.stringify({ type: 'audio_chunk', data: buffered }));
+            }
+            teamsAudioChunkQueue = [];
+        }
         chunkCount++;
         if (chunkCount === 1) {
             console.log('[Teams→AI] First audio chunk forwarded to Voice Live');
@@ -2258,11 +2592,25 @@ async function _attachTeamsIncomingStream(remoteAudioStream) {
     source.connect(teamsInWorkletNode);
     // Do NOT connect to destination — we don't want double playback
 
+    // Subscribe to track availability changes so we restart capture if the
+    // remote audio stream is interrupted and comes back (e.g. network glitch).
+    try {
+        remoteAudioStream.on('isAvailableChanged', async () => {
+            if (remoteAudioStream.isAvailable) {
+                addMessage('system', '[Teams→AI] Remote audio stream became available — restarting capture', true);
+                await _attachTeamsIncomingStream(remoteAudioStream);
+            } else {
+                addMessage('system', '[Teams→AI] Remote audio stream unavailable', true);
+                stopTeamsAudioCapture();
+            }
+        });
+    } catch (_) {}
+
     addMessage('system', '[Teams→AI] ✓ Streaming Teams audio to Voice Live', true);
     setTeamsStatus('Teams: Connected ✓ + sending audio to AI');
 }
 
-function stopTeamsAudioCapture() {
+function stopTeamsAudioCapture(keepListener = false) {
     const wasRunning = !!(teamsInWorkletNode || teamsInAudioCtx);
     if (teamsInWorkletNode) {
         try { teamsInWorkletNode.disconnect(); } catch (_) {}
@@ -2271,6 +2619,14 @@ function stopTeamsAudioCapture() {
     if (teamsInAudioCtx) {
         try { teamsInAudioCtx.close(); } catch (_) {}
         teamsInAudioCtx = null;
+    }
+    teamsAudioChunkQueue = [];
+    // Remove the permanent remoteAudioStreamsUpdated listener unless the caller
+    // is re-attaching (keepListener=true), in which case the listener stays
+    // registered so stream replacement continues to be handled.
+    if (!keepListener && _remoteAudioStreamsHandler && teamsCall) {
+        try { teamsCall.off('remoteAudioStreamsUpdated', _remoteAudioStreamsHandler); } catch (_) {}
+        _remoteAudioStreamsHandler = null;
     }
     if (wasRunning) {
         addMessage('system', '[Teams→AI] Stopped streaming Teams audio to Voice Live', true);

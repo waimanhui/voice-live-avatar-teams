@@ -428,6 +428,11 @@
                         <label class="teams-toggle-label">
                             <input type="checkbox" id="teamsSendVideo" onchange="onTeamsSendVideoChange()"> Send avatar video to Teams
                         </label>
+                        <div id="teamsVideoSettings" style="display:flex;gap:6px;align-items:center;font-size:0.82rem;margin-top:4px;flex-wrap:wrap">
+                            <label style="display:flex;align-items:center;gap:4px;margin:0">W <input type="number" id="teamsVideoWidth" value="960" min="320" max="1920" step="8" autocomplete="off" style="width:58px;padding:2px 4px;font-size:0.82rem" /></label>
+                            <label style="display:flex;align-items:center;gap:4px;margin:0">H <input type="number" id="teamsVideoHeight" value="540" min="180" max="1080" step="8" autocomplete="off" style="width:58px;padding:2px 4px;font-size:0.82rem" /></label>
+                            <label style="display:flex;align-items:center;gap:4px;margin:0">FPS <input type="number" id="teamsVideoFps" value="25" min="5" max="30" step="1" autocomplete="off" style="width:44px;padding:2px 4px;font-size:0.82rem" /></label>
+                        </div>
                         <div id="teamsAudioFileRow" style="display:none;margin-top:4px">
                             <input type="file" id="teamsAudioFile" accept="audio/*" style="width:100%;font-size:0.8rem" />
                             <label style="margin-top:4px;display:flex;align-items:center;gap:6px;font-size:0.82rem">
