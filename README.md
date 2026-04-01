@@ -47,6 +47,10 @@ A Python (FastAPI) + browser-based sample that demonstrates the **Azure AI Voice
          └──────────────────┘
 ```
 
+
+https://github.com/user-attachments/assets/e60f0881-036b-4f8a-b00c-b45d07b1b4f4
+
+
 ### Key design points
 
 | Component | Responsibility |
